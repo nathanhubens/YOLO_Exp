@@ -1,0 +1,26 @@
+# Model checkpoints (downloaded automatically by ultralytics)
+*.pt
+*.onnx
+
+# Ultralytics training output (regenerated each run)
+runs/
+
+# Datasets (downloaded automatically by ultralytics)
+datasets/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
