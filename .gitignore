@@ -24,3 +24,8 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Jupyter scratch
+.ipynb_checkpoints/
+Untitled*.ipynb
+*-checkpoint.ipynb
