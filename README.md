@@ -174,6 +174,44 @@ Key insights:
 | `--prune-schedule` | `onecycle` | Or `agp`, `oneshot`, `iterative` |
 | `--onecycle-alpha` / `--onecycle-beta` | 14 / 6 | Logistic shape; defaults preserve early/late epochs |
 
+## Inspecting the Pruned Model
+
+The `runs/pose/<run>/weights/last.pt` file contains the actual pruned tensors
+(verified: `sum(p.numel())` returns the reduced count). **But Netron and other
+`.pt` visualizers may render it as if it were unpruned.**
+
+Why: ultralytics stores the original `model.yaml` architecture spec as an
+attribute on the saved model object. Netron reads that YAML (which still says
+"1024 channels in model.7") to draw the architecture, then overlays the actual
+weight values. Result: identical-looking layer boxes between baseline and
+pruned files, only weight values differ.
+
+**To visualize the true pruned architecture, use the auto-exported ONNX file:**
+
+```bash
+# After a successful run, pruned_model.onnx is written to the current dir.
+# Open it in Netron — shape annotations will show the actual pruned channels.
+netron pruned_model.onnx
+```
+
+ONNX export traces a real forward pass and bakes the per-tensor shapes into
+the graph definition itself. Both `prune_yolov8_pose_simple.py` and
+`prune_yolov8_pose_p6_simple.py` emit this on completion.
+
+**To verify the saved `.pt` from Python:**
+
+```python
+import sys, torch
+sys.path.insert(0, ".")
+from prune_yolov8_pose import C2f_v2  # required for unpickling
+
+ckpt = torch.load("runs/pose/<run>/weights/last.pt", weights_only=False, map_location="cpu")
+m = ckpt["model"]
+print(f"Params: {sum(p.numel() for p in m.parameters()) / 1e6:.3f}M")
+print(f"model.7.conv weight shape: {tuple(m.model[7].conv.weight.shape)}")
+# Compare against baseline yolov8n-pose to see the difference.
+```
+
 ## Decomposition of Pose mAP Loss
 
 Empirically validated on coco-pose:

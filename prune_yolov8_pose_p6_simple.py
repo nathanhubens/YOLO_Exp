@@ -258,6 +258,31 @@ def main():
     macs, params = tp.utils.count_ops_and_params(
         yolo.model.to(device), example_inputs
     )
+
+    # Export pruned model to ONNX. The .pt checkpoint preserves the original
+    # `model.yaml` architecture spec (which Netron and similar tools read for
+    # visualization), so the .pt LOOKS unpruned in Netron even though the
+    # weights are smaller. ONNX bakes the actual tensor shapes into the
+    # graph definition. P6 needs higher opset for some ops; opset_version=13
+    # works for both n-pose and yolov8x-pose-p6.
+    onnx_path = "pruned_model.onnx"
+    try:
+        yolo.model.cpu().eval()
+        sample_cpu = torch.randn(1, 3, args.imgsz, args.imgsz)
+        torch.onnx.export(
+            yolo.model, sample_cpu, onnx_path,
+            opset_version=13,
+            input_names=["images"], output_names=["output"],
+            dynamic_axes={"images": {0: "batch"}, "output": {0: "batch"}},
+            dynamo=False,
+        )
+        print(f"\nExported pruned model to {onnx_path}")
+    except Exception as e:
+        pt_path = "pruned_model.pt"
+        torch.save({"model": yolo.model}, pt_path)
+        print(f"\nONNX export failed ({type(e).__name__}): {str(e)[:120]}")
+        print(f"Saved pruned weights to {pt_path} as fallback.")
+
     final = {
         **metrics,
         "params_m": round(params / 1e6, 3),
