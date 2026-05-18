@@ -241,6 +241,8 @@ def fine_tune(yolo: YOLO, **train_kwargs) -> nn.Module:
     trainer.final_eval = lambda: None  # skip the "load best and re-validate" step
     trainer.train()
     yolo.model = trainer.model
+    # Expose the saved checkpoint path so callers can find/report it.
+    yolo._last_pt_path = str(trainer.last)
     return trainer.model
 
 

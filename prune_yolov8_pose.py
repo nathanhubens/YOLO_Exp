@@ -255,7 +255,87 @@ def fine_tune(yolo: YOLO, **train_kwargs) -> nn.Module:
     trainer.final_eval = lambda: None  # skip the "load best and re-validate" step
     trainer.train()
     yolo.model = trainer.model
+    # Expose the saved checkpoint path so callers can find/report it.
+    # `trainer.last` is a pathlib.Path to runs/<task>/train<N>/weights/last.pt.
+    yolo._last_pt_path = str(trainer.last)
     return trainer.model
+
+
+# ---------------------------------------------------------------------------
+# End-of-training summary helper
+# ---------------------------------------------------------------------------
+
+def print_pruning_summary(
+    yolo_pruned,
+    baseline_model_path: str,
+    last_pt_path: str | None = None,
+) -> None:
+    """Print a side-by-side weight-shape comparison between the baseline
+    checkpoint and the pruned model, plus the saved-checkpoint path.
+
+    Only compares layer paths that survive the C2→C2_v2 / C2f→C2f_v2
+    surgery: plain `Conv` layers (stem, downsamplers) and the `cv2`
+    output-projection inside each CSP block (the surgery reuses `cv2`
+    unchanged). `cv1` / `cv0` paths diverge across the surgery and aren't
+    meaningfully comparable.
+    """
+    from ultralytics import YOLO
+
+    print("\n" + "=" * 100)
+    print(f"Pruning summary — baseline ({baseline_model_path}) vs pruned")
+    print("=" * 100)
+
+    yolo_base = YOLO(baseline_model_path)
+    base_mods = dict(yolo_base.model.named_modules())
+    prune_mods = dict(yolo_pruned.model.named_modules())
+
+    candidates = [
+        ("model.0.conv",       "stem (3-ch input — PROTECTED)"),
+        ("model.1.conv",       "first backbone downsample"),
+        ("model.3.conv",       "backbone downsample"),
+        ("model.5.conv",       "backbone downsample"),
+        ("model.7.conv",       "deeper backbone downsample"),
+        ("model.9.conv",       "deepest backbone Conv (P6 only)"),
+        ("model.2.cv2.conv",   "first CSP block — output projection"),
+        ("model.4.cv2.conv",   "CSP block — output projection"),
+        ("model.6.cv2.conv",   "CSP block — output projection"),
+        ("model.8.cv2.conv",   "CSP block — output projection"),
+    ]
+
+    print(f"{'Layer':<24} {'Baseline shape':<22} {'Pruned shape':<22} "
+          f"{'Δ':<22}  Description")
+    print("-" * 100)
+    for path, desc in candidates:
+        b, p = base_mods.get(path), prune_mods.get(path)
+        if b is None or p is None or not hasattr(b, "weight") or not hasattr(p, "weight"):
+            continue
+        bs, ps = tuple(b.weight.shape), tuple(p.weight.shape)
+        if bs == ps:
+            change = "unchanged"
+        else:
+            parts = []
+            if bs[0] != ps[0]:
+                parts.append(f"out −{(1-ps[0]/bs[0])*100:.1f}%")
+            if bs[1] != ps[1]:
+                parts.append(f"in −{(1-ps[1]/bs[1])*100:.1f}%")
+            change = ", ".join(parts) if parts else "unchanged"
+        print(f"{path:<24} {str(bs):<22} {str(ps):<22} {change:<22}  {desc}")
+
+    # Overall totals
+    base_params = sum(p.numel() for p in yolo_base.model.parameters())
+    prune_params = sum(p.numel() for p in yolo_pruned.model.parameters())
+    print("-" * 100)
+    print(f"Total params: {base_params/1e6:.3f} M → {prune_params/1e6:.3f} M "
+          f"({(1 - prune_params/base_params)*100:.2f}% reduction)")
+
+    if last_pt_path is None:
+        last_pt_path = getattr(yolo_pruned, "_last_pt_path", None)
+    if last_pt_path:
+        print(f"\nSaved checkpoint: {last_pt_path}")
+        print(f"To load: `from prune_yolov8_pose import C2f_v2; "
+              f"yolo = YOLO('{last_pt_path}')`")
+    print("=" * 100 + "\n")
+    del yolo_base
 
 
 # ---------------------------------------------------------------------------

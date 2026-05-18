@@ -56,8 +56,8 @@ from prune_yolov8_pose_p6 import (
     _validate_final,
     _log_experiment,
 )
-# Criteria registry comes from the n-pose script (same set works for P6).
-from prune_yolov8_pose import CRITERIA
+# Criteria registry + the shared end-of-training summary helper.
+from prune_yolov8_pose import CRITERIA, print_pruning_summary
 from fasterai.prune.all import (
     Pruner, Schedule,
     sched_onecycle, sched_agp, sched_oneshot, sched_iterative,
@@ -295,6 +295,12 @@ def main():
         "macs_g": round(base_macs / 1e9, 3),
     }
     _log_experiment(args, baseline, final, wall_time_s=time.time() - t0)
+
+    # Side-by-side layer comparison + saved checkpoint path. The .pt is
+    # at runs/pose/train<N>/weights/last.pt — exact path stored on `yolo`
+    # by `fine_tune()` as `yolo._last_pt_path`.
+    print_pruning_summary(yolo, args.model)
+
     print(f"\nDone in {(time.time()-t0)/60:.1f} min.")
 
 
