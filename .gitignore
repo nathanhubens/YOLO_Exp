@@ -10,7 +10,7 @@ datasets/
 
 # Python
 __pycache__/
-*.pyc
+*.pyc   
 *.pyo
 *.egg-info/
 .venv/
@@ -24,3 +24,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# results
+*.csv
