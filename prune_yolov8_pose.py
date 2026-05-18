@@ -262,6 +262,56 @@ def fine_tune(yolo: YOLO, **train_kwargs) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
+# Optimizer / EMA refresh after pruning
+# ---------------------------------------------------------------------------
+# Ultralytics' BaseTrainer builds the optimizer with THREE parameter groups:
+#   group 0: biases             (no weight_decay)
+#   group 1: weights w/ decay   (Conv/Linear weights)
+#   group 2: norm weights       (BN/Norm gamma — no weight_decay)
+# The LR scheduler is built around these 3 groups and emits 3 lambda values
+# per step. If we naïvely rebuild the optimizer with `model.parameters()`,
+# all params collapse into a SINGLE group → on the next `scheduler.step()`
+# torch's `zip(param_groups, values, strict=True)` raises
+#   ValueError: zip() argument 2 is longer than argument 1
+# (older torch versions silently truncated, leaving 2 of 3 group LRs stuck.)
+#
+# Fix: KEEP the optimizer object (so the scheduler's reference stays valid)
+# and just refresh the `params` list of each of the 3 existing groups with
+# the post-prune model's parameters, classified the same way ultralytics
+# originally classified them.
+
+def refresh_optimizer_after_prune(model: nn.Module, optimizer) -> None:
+    """Update an ultralytics-built optimizer's 3 param groups to point at
+    the post-prune model's parameters. Preserves group structure, lr,
+    weight_decay, momentum. Clears per-parameter state (Adam's m/v) since
+    old Parameter objects are gone after torch-pruning's structural resize."""
+    bn_classes = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)
+    g_bias, g_weight, g_norm = [], [], []
+    for module_name, module in model.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if "bias" in param_name:
+                g_bias.append(param)
+            elif isinstance(module, bn_classes):
+                g_norm.append(param)
+            else:
+                g_weight.append(param)
+
+    if len(optimizer.param_groups) == 3:
+        # Ultralytics' canonical order: biases / weights / norm.
+        optimizer.param_groups[0]["params"] = g_bias
+        optimizer.param_groups[1]["params"] = g_weight
+        optimizer.param_groups[2]["params"] = g_norm
+    else:
+        # Non-ultralytics optimizer (e.g., test runs with a custom optimizer):
+        # lump everything into the first/only group.
+        optimizer.param_groups[0]["params"] = g_bias + g_weight + g_norm
+
+    # Drop the per-parameter state cache. Adam's m/v are keyed by Parameter
+    # identity; after torch-pruning replaces tensors the old keys are dead.
+    optimizer.state.clear()
+
+
+# ---------------------------------------------------------------------------
 # End-of-training summary helper
 # ---------------------------------------------------------------------------
 

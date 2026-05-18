@@ -56,8 +56,12 @@ from prune_yolov8_pose_p6 import (
     _validate_final,
     _log_experiment,
 )
-# Criteria registry + the shared end-of-training summary helper.
-from prune_yolov8_pose import CRITERIA, print_pruning_summary
+# Criteria registry + shared helpers from the n-pose script (work for P6 too).
+from prune_yolov8_pose import (
+    CRITERIA,
+    print_pruning_summary,
+    refresh_optimizer_after_prune,
+)
 from fasterai.prune.all import (
     Pruner, Schedule,
     sched_onecycle, sched_agp, sched_oneshot, sched_iterative,
@@ -118,21 +122,11 @@ def make_prune_callback(pruner: Pruner, schedule: Schedule, args,
             if hasattr(trainer, "ema") and trainer.ema is not None:
                 trainer.ema = ModelEMA(trainer.model)
 
-            # Rebuild optimizer with new parameter shapes; preserve LR.
+            # Refresh the optimizer in-place: keep the same Optimizer object
+            # (so trainer.scheduler's 3-group LR lambdas stay valid) and just
+            # replace each group's `params` list with the post-prune params.
             if hasattr(trainer, "optimizer") and trainer.optimizer is not None:
-                old_opt = trainer.optimizer
-                old_groups = old_opt.param_groups
-                new_optimizer = type(old_opt)(
-                    trainer.model.parameters(),
-                    lr=old_groups[0].get("lr", args.lr),
-                )
-                for new_g, old_g in zip(new_optimizer.param_groups, old_groups):
-                    for k, v in old_g.items():
-                        if k != "params":
-                            new_g[k] = v
-                trainer.optimizer = new_optimizer
-                if hasattr(trainer, "scheduler") and trainer.scheduler is not None:
-                    trainer.scheduler.optimizer = new_optimizer
+                refresh_optimizer_after_prune(trainer.model, trainer.optimizer)
 
             # Re-snapshot init buffers for movement criteria.
             if args.criterion in ("movement", "updating_movement"):

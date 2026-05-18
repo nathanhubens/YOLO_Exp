@@ -41,6 +41,7 @@ from prune_yolov8_pose import (
     _validate_final,
     _log_experiment,
     print_pruning_summary,
+    refresh_optimizer_after_prune,
 )
 from fasterai.prune.all import (
     Pruner, Schedule,
@@ -110,24 +111,13 @@ def make_prune_callback(pruner: Pruner, schedule: Schedule, args,
             if hasattr(trainer, "ema") and trainer.ema is not None:
                 trainer.ema = ModelEMA(trainer.model)
 
-            # Rebuild optimizer to track new parameter shapes. Preserve
-            # current LR + group hyperparameters so warmup/decay still
-            # apply correctly.
+            # Refresh the optimizer in-place: keep the same Optimizer object
+            # (so trainer.scheduler's reference + the 3-group structure both
+            # stay valid) and just replace each group's `params` list with
+            # the post-prune classified params. See docstring of
+            # `refresh_optimizer_after_prune` for the bug this avoids.
             if hasattr(trainer, "optimizer") and trainer.optimizer is not None:
-                old_opt = trainer.optimizer
-                old_groups = old_opt.param_groups
-                new_optimizer = type(old_opt)(
-                    trainer.model.parameters(),
-                    lr=old_groups[0].get("lr", args.lr),
-                )
-                for new_g, old_g in zip(new_optimizer.param_groups, old_groups):
-                    for k, v in old_g.items():
-                        if k != "params":
-                            new_g[k] = v
-                trainer.optimizer = new_optimizer
-                # Scheduler holds a stale reference to the old optimizer.
-                if hasattr(trainer, "scheduler") and trainer.scheduler is not None:
-                    trainer.scheduler.optimizer = new_optimizer
+                refresh_optimizer_after_prune(trainer.model, trainer.optimizer)
 
             # Re-snapshot init buffers for movement criteria. Mirrors
             # the iterative script's behavior — converts movement into
