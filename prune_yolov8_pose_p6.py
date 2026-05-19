@@ -204,6 +204,20 @@ def find_protected_layers(model: nn.Module) -> list[nn.Module]:
     if hasattr(head, "dfl"):
         protected.append(head.dfl)
 
+    # Second-to-last Conv2d of the LARGEST-SCALE class head. The cv3
+    # protection above only shields the FINAL Conv of each branch; the
+    # intermediate Conv of the largest-scale branch (where large objects
+    # — and therefore most pose-relevant detections — fire) is also
+    # load-bearing per the n-pose sensitivity probe (pose drop 0.148).
+    # The P6 model hasn't been probed yet, but the same logical pathway
+    # exists, so we apply the same protection by symmetry. Variant-
+    # agnostic: cv3[-1] works for both 3-scale (non-P6) and 4-scale (P6).
+    if hasattr(head, "cv3") and len(head.cv3) >= 1:
+        cv3_largest = head.cv3[-1]
+        convs = [m for m in cv3_largest.modules() if isinstance(m, nn.Conv2d)]
+        if len(convs) >= 2:
+            protected.append(convs[-2])
+
     return protected
 
 
