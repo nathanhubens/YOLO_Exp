@@ -50,15 +50,35 @@ SENSITIVITY_TIERS = (
     (0.000, 0.22),  # AGGRESSIVE (default — covers everything below 0.005)
 )
 
+# Experimental 7-tier variant: adds an EXTREME tier (ratio 0.30) for layers
+# whose sensitivity probe drop is essentially zero (< 0.001). These layers
+# include model.8.cv2.conv (negative drop — pruning IMPROVES val!) and the
+# box-head intermediates (cv2.X.0/.1) where ~30% pruning is empirically free.
+# Opt-in via --enable-extreme-tier in the simple scripts for A/B testing.
+SENSITIVITY_TIERS_EXTREME = (
+    (0.100, 0.00),  # PROTECT
+    (0.050, 0.03),  # MILD
+    (0.020, 0.06),  # LIGHT
+    (0.010, 0.10),  # MODERATE
+    (0.005, 0.15),  # STRONG
+    (0.001, 0.22),  # AGGRESSIVE
+    (0.000, 0.30),  # EXTREME (new — for ~zero-impact layers)
+)
+
 
 def load_asymmetric_ratios(
     jsonl_path: Path | None = None,
     scale: float = 1.0,
+    tiers=None,
 ) -> dict[str, float]:
     """Load sensitivity_results.jsonl and bucket each layer's pose_drop into
     a tiered per-layer pruning ratio. `scale` multiplies all ratios uniformly,
     so scale<1 reduces total compression and scale>1 increases it. PROTECT
-    tier (ratio=0) stays at 0 regardless of scale. Returns name → ratio in [0, 1]."""
+    tier (ratio=0) stays at 0 regardless of scale. `tiers` selects between
+    the canonical 6-tier and experimental 7-tier (EXTREME) tables; defaults
+    to SENSITIVITY_TIERS. Returns name → ratio in [0, 1]."""
+    if tiers is None:
+        tiers = SENSITIVITY_TIERS
     if jsonl_path is None:
         jsonl_path = Path(__file__).resolve().parent / "sensitivity_results.jsonl"
     if not jsonl_path.exists():
@@ -71,7 +91,7 @@ def load_asymmetric_ratios(
         rec = json.loads(line)
         if "pose_drop" not in rec:
             continue
-        for thresh, ratio in SENSITIVITY_TIERS:
+        for thresh, ratio in tiers:
             if rec["pose_drop"] >= thresh:
                 ratios[rec["name"]] = min(1.0, max(0.0, ratio * scale))
                 break

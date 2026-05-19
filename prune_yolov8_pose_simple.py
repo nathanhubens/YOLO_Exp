@@ -186,6 +186,19 @@ def main():
                    help="β (offset) for sched_onecycle. Default 6 places the "
                         "inflection at pct_train≈0.43. Smaller pushes prunes "
                         "earlier; larger pushes them later.")
+    # Experimental flags for A/B testing against the canonical recipe.
+    p.add_argument("--protect-sppf", action="store_true",
+                   help="EXPERIMENTAL: additionally protect SPPF.cv1.conv "
+                        "(backbone→neck bridge). Sensitivity probe drop "
+                        "0.0983 — just below the standard protect threshold "
+                        "of 0.10. Adds ~33k params (~1%%) to protected set.")
+    p.add_argument("--enable-extreme-tier", action="store_true",
+                   help="EXPERIMENTAL: use the 7-tier sensitivity table that "
+                        "includes an EXTREME tier (ratio 0.30) for layers "
+                        "with probe drop < 0.001. Pushes ~5-10 'over-"
+                        "provisioned' layers (model.8.*, box-head intermediates) "
+                        "harder while keeping the rest unchanged. Only takes "
+                        "effect with --asymmetric.")
     args = p.parse_args()
     if args.steps is None:
         args.steps = args.epochs
@@ -204,6 +217,14 @@ def main():
     print(f"Baseline: {base_macs/1e9:.2f} GMACs, {base_params/1e6:.2f}M params")
 
     protected = find_protected_layers(model)
+    # Optional extra protection (opt-in for A/B testing).
+    if args.protect_sppf:
+        sppf = next((m for m in model.modules() if type(m).__name__ == "SPPF"), None)
+        if sppf is not None and hasattr(sppf, "cv1") and hasattr(sppf.cv1, "conv"):
+            protected.append(sppf.cv1.conv)
+            print("--protect-sppf: added SPPF.cv1.conv to protected set")
+        else:
+            print("--protect-sppf: SPPF not found; skipping")
     print(f"Protecting {len(protected)} layer(s)")
 
     criterion_fn = CRITERIA[args.criterion]
@@ -213,9 +234,12 @@ def main():
                 m.register_buffer("_init_weights", m.weight.detach().clone())
 
     if args.asymmetric:
-        ratio_arg = load_asymmetric_ratios(scale=args.asymmetric_scale)
+        from prune_yolov8_pose import SENSITIVITY_TIERS, SENSITIVITY_TIERS_EXTREME
+        tiers = SENSITIVITY_TIERS_EXTREME if args.enable_extreme_tier else SENSITIVITY_TIERS
+        ratio_arg = load_asymmetric_ratios(scale=args.asymmetric_scale, tiers=tiers)
+        tier_label = "7-tier (EXTREME)" if args.enable_extreme_tier else "6-tier"
         print(f"Asymmetric: {len(ratio_arg)} per-layer ratios "
-              f"(scale={args.asymmetric_scale})")
+              f"(scale={args.asymmetric_scale}, {tier_label})")
     else:
         ratio_arg = args.ratio
 

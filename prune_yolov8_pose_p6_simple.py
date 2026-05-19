@@ -184,6 +184,9 @@ def main():
                    default="onecycle")
     p.add_argument("--onecycle-alpha", type=float, default=14)
     p.add_argument("--onecycle-beta", type=float, default=6)
+    p.add_argument("--protect-sppf", action="store_true",
+                   help="EXPERIMENTAL: additionally protect SPPF.cv1.conv. "
+                        "See prune_yolov8_pose_simple.py for the rationale.")
     args = p.parse_args()
     if args.steps is None:
         args.steps = args.epochs
@@ -208,6 +211,13 @@ def main():
     print(f"Baseline: {base_macs/1e9:.2f} GMACs, {base_params/1e6:.2f}M params")
 
     protected = find_protected_layers(model)
+    if args.protect_sppf:
+        sppf = next((m for m in model.modules() if type(m).__name__ == "SPPF"), None)
+        if sppf is not None and hasattr(sppf, "cv1") and hasattr(sppf.cv1, "conv"):
+            protected.append(sppf.cv1.conv)
+            print("--protect-sppf: added SPPF.cv1.conv to protected set")
+        else:
+            print("--protect-sppf: SPPF not found; skipping")
     print(f"Protecting {len(protected)} layer(s)")
 
     criterion_fn = CRITERIA[args.criterion]
