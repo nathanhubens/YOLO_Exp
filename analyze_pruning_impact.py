@@ -151,8 +151,11 @@ def main():
                     "applied_ratio": ratio_used,
                     "sensitivity_shift": shift,
                 }
+                # f-string format specs can't contain `if/else` inline;
+                # build the pre-train string separately to avoid ValueError.
+                pre_str = f"{pre_drop:+.4f}" if pre_drop is not None else "  N/A"
                 print(f"   post-train Δ pose={post_drop:+.4f}  "
-                      f"(pre-train was {pre_drop:+.4f if pre_drop is not None else 0.0})  "
+                      f"(pre-train was {pre_str})  "
                       f"applied_ratio={ratio_used}  "
                       f"({time.time()-t_layer:.0f}s)")
             except Exception as e:
