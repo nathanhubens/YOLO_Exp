@@ -38,6 +38,7 @@ from prune_yolov8_pose import (
     fine_tune,
     CRITERIA,
     load_asymmetric_ratios,
+    load_reallocated_ratios,
     _validate_final,
     _log_experiment,
     print_pruning_summary,
@@ -67,15 +68,18 @@ def make_prune_callback(pruner: Pruner, schedule: Schedule, args,
         "total_epochs": args.epochs,
         "pruned_pct": 0.0,        # cumulative param reduction
         "macs_reduction_pct": 0.0,
+        "best_pose": -1.0,        # best post-prune val pose mAP (for best.pt)
     }
     example_inputs = torch.randn(1, 3, args.imgsz, args.imgsz, device=device)
 
     def cb(trainer):
         epoch = trainer.epoch  # 0-indexed
-        # Schedule-driven trigger. Use (epoch+1)/total so pct_train hits
-        # 1.0 at the last epoch — otherwise the final prune step never
-        # fires (sched_onecycle's progress(0.98) is still < 1.0).
-        pct_train = (epoch + 1) / max(state["total_epochs"], 1)
+        # Schedule-driven trigger. pct_train is normalized to `prune_epochs`,
+        # not total epochs: pruning saturates by epoch=prune_epochs, after which
+        # prunes_made==steps and epochs prune_epochs..total are a pure
+        # fine-tuning tail at the final (frozen) architecture. min(1.0, …) so the
+        # final prune step still fires (sched_onecycle's progress(0.98) < 1.0).
+        pct_train = min(1.0, (epoch + 1) / max(args.prune_epochs, 1))
         target_steps = int(schedule.sched_func(0, 1, pct_train) * args.steps)
         target_steps = min(target_steps, args.steps)
 
@@ -159,6 +163,23 @@ def make_prune_callback(pruner: Pruner, schedule: Schedule, args,
                 msg += f"  {short}={m[k]:.4f}"
         print(msg)
 
+        # Save best.pt ONLY after pruning is complete. Every checkpoint in the
+        # fine-tuning tail is the final (frozen) architecture, so it's a valid
+        # compressed model. A high-mAP epoch DURING pruning is at a larger,
+        # less-pruned architecture and must NOT be saved as "best". Save the EMA
+        # weights (what ultralytics validated → matches the tracked mAP), same
+        # full-model format as last.pt so it loads with C2f_v2 in scope.
+        if state["prunes_made"] >= args.steps:
+            pose = m.get("metrics/mAP50-95(P)")
+            if pose is not None and pose > state["best_pose"]:
+                state["best_pose"] = pose
+                src = (trainer.ema.ema if getattr(trainer, "ema", None)
+                       and trainer.ema.ema is not None else trainer.model)
+                torch.save({"model": deepcopy(src),
+                            "train_args": vars(trainer.args)}, trainer.best)
+                print(f"   ↳ new best (post-prune) pose={pose:.4f} "
+                      f"→ saved {trainer.best.name}")
+
     return cb, end_cb, state
 
 
@@ -169,6 +190,11 @@ def main():
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--steps", type=int, default=None,
                    help="Number of prune events. Default = epochs (gradual).")
+    p.add_argument("--prune-epochs", type=int, default=None,
+                   help="Confine all pruning to the first N epochs; epochs "
+                        "N..total are a pure fine-tuning tail at the final frozen "
+                        "architecture (and where best.pt is saved). Default = "
+                        "epochs (pruning spans the whole run, no tail).")
     p.add_argument("--imgsz", type=int, default=640)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--ratio", type=float, default=0.12)
@@ -199,9 +225,37 @@ def main():
                         "provisioned' layers (model.8.*, box-head intermediates) "
                         "harder while keeping the rest unchanged. Only takes "
                         "effect with --asymmetric.")
+    p.add_argument("--reallocate", action="store_true",
+                   help="EXPERIMENTAL: bucket per-layer ratios by POST-training "
+                        "sensitivity (impact_analysis_train22.jsonl) instead of "
+                        "the pre-training probe. Self-contained — supersedes "
+                        "--asymmetric/--protect-sppf/--enable-extreme-tier, since "
+                        "the post-train bucketing already encodes all three. Holds "
+                        "global compression ~21.4%% (REALLOC_SCALE-calibrated) while "
+                        "easing FPN/SPPF.cv1 and pushing empirically-free layers. "
+                        "Tune further with --asymmetric-scale.")
+    p.add_argument("--augment", action="store_true",
+                   help="EXPERIMENTAL: re-enable recovery augmentation (mosaic, "
+                        "scale, fliplr) instead of fine_tune()'s aug-off defaults. "
+                        "mosaic auto-closes for the final epochs//5 epochs so the "
+                        "model settles on clean images and BN stats stabilize. The "
+                        "aug-off default is the right choice during pruning; this "
+                        "flag is for testing whether regularization breaks the "
+                        "fine-tuning plateau in the recovery phase.")
+    p.add_argument("--close-mosaic", type=int, default=None,
+                   help="Number of FINAL epochs to disable mosaic (clean-image "
+                        "finish so BN stats settle). Only used with --augment. "
+                        "Default = 15 (fixed tail), so longer runs get "
+                        "proportionally longer augmentation. The augmented phase "
+                        "is therefore epochs - close_mosaic.")
     args = p.parse_args()
     if args.steps is None:
         args.steps = args.epochs
+    if args.prune_epochs is None:
+        args.prune_epochs = args.epochs   # pruning spans whole run (no tail)
+    if args.prune_epochs > args.epochs:
+        p.error(f"--prune-epochs ({args.prune_epochs}) cannot exceed "
+                f"--epochs ({args.epochs})")
 
     t0 = time.time()
 
@@ -233,7 +287,15 @@ def main():
             if hasattr(m, "weight") and m.weight is not None:
                 m.register_buffer("_init_weights", m.weight.detach().clone())
 
-    if args.asymmetric:
+    if args.reallocate:
+        # Post-training-sensitivity reallocation. Self-contained: encodes
+        # protection + extreme tier via the post-train bucketing, so it
+        # ignores --asymmetric/--protect-sppf/--enable-extreme-tier.
+        ratio_arg = load_reallocated_ratios(scale=args.asymmetric_scale)
+        print(f"Reallocate: {len(ratio_arg)} per-layer ratios bucketed by "
+              f"POST-training impact (scale={args.asymmetric_scale}, "
+              f"effective ×{args.asymmetric_scale * 1.15:.3f})")
+    elif args.asymmetric:
         from prune_yolov8_pose import SENSITIVITY_TIERS, SENSITIVITY_TIERS_EXTREME
         tiers = SENSITIVITY_TIERS_EXTREME if args.enable_extreme_tier else SENSITIVITY_TIERS
         ratio_arg = load_asymmetric_ratios(scale=args.asymmetric_scale, tiers=tiers)
@@ -280,8 +342,23 @@ def main():
     # Single yolo.train() call — full ultralytics machinery.
     # `fine_tune` wraps it with our safe-defaults (warmup_bias_lr=0, aug off).
     lr_kwargs = {"lr0": args.lr, "optimizer": "AdamW"} if args.lr is not None else {}
+    aug_kwargs = {}
+    if args.augment:
+        # Recovery augmentation: override fine_tune()'s aug-off safe defaults.
+        # close_mosaic disables mosaic for the final epochs so the model
+        # fine-tunes on clean images and BN running stats settle. Default is a
+        # FIXED 15-epoch clean tail (not epochs//5), so longer runs get
+        # proportionally longer augmentation; override with --close-mosaic.
+        close_m = args.close_mosaic if args.close_mosaic is not None else 15
+        close_m = min(close_m, args.epochs)   # can't exceed run length
+        aug_kwargs = {"mosaic": 1.0, "close_mosaic": close_m,
+                      "scale": 0.5, "fliplr": 0.5}
+        print(f"--augment: recovery augmentation ON "
+              f"(mosaic=1.0, close_mosaic={close_m}, scale=0.5, fliplr=0.5) "
+              f"→ {args.epochs - close_m} augmented epochs")
     fine_tune(yolo, data=args.data, epochs=args.epochs,
-              imgsz=args.imgsz, batch=args.batch, verbose=True, **lr_kwargs)
+              imgsz=args.imgsz, batch=args.batch, verbose=True,
+              **lr_kwargs, **aug_kwargs)
 
     # Final val + log.
     metrics = _validate_final(yolo, args.data, args.imgsz, args.batch)
