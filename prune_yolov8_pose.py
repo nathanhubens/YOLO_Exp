@@ -70,32 +70,75 @@ def load_asymmetric_ratios(
     jsonl_path: Path | None = None,
     scale: float = 1.0,
     tiers=None,
+    drop_field: str = "pose_drop",
+    fallback_last_tier: bool = False,
 ) -> dict[str, float]:
-    """Load sensitivity_results.jsonl and bucket each layer's pose_drop into
-    a tiered per-layer pruning ratio. `scale` multiplies all ratios uniformly,
-    so scale<1 reduces total compression and scale>1 increases it. PROTECT
-    tier (ratio=0) stays at 0 regardless of scale. `tiers` selects between
-    the canonical 6-tier and experimental 7-tier (EXTREME) tables; defaults
-    to SENSITIVITY_TIERS. Returns name → ratio in [0, 1]."""
+    """Load a sensitivity JSONL and bucket each layer's drop into a tiered
+    per-layer pruning ratio. `scale` multiplies all ratios uniformly, so
+    scale<1 reduces total compression and scale>1 increases it. PROTECT tier
+    (ratio=0) stays at 0 regardless of scale. `tiers` selects between the
+    canonical 6-tier and experimental 7-tier (EXTREME) tables; defaults to
+    SENSITIVITY_TIERS. `drop_field` is the record key to bucket on — defaults
+    to "pose_drop" (pre-training probe); pass "post_train_pose_drop" to bucket
+    on the post-training impact analysis instead. `fallback_last_tier` controls
+    layers whose drop is below the lowest threshold (e.g. negative — pruning
+    *improves* val): when False (default) they're omitted (ratio 0, frozen
+    behavior for the canonical recipe); when True they're assigned the most-
+    aggressive tier, since a below-threshold drop means least-sensitive.
+    Returns name → ratio in [0, 1]."""
     if tiers is None:
         tiers = SENSITIVITY_TIERS
     if jsonl_path is None:
         jsonl_path = Path(__file__).resolve().parent / "sensitivity_results.jsonl"
     if not jsonl_path.exists():
         raise FileNotFoundError(
-            f"Asymmetric ratios require sensitivity_results.jsonl. "
+            f"Per-layer ratios require {jsonl_path.name}. "
             f"Run: python sensitivity.py --data <data> --ratio 0.30"
         )
     ratios = {}
     for line in jsonl_path.read_text().strip().split("\n"):
         rec = json.loads(line)
-        if "pose_drop" not in rec:
+        if drop_field not in rec:
             continue
         for thresh, ratio in tiers:
-            if rec["pose_drop"] >= thresh:
+            if rec[drop_field] >= thresh:
                 ratios[rec["name"]] = min(1.0, max(0.0, ratio * scale))
                 break
+        else:
+            # No threshold matched → drop is below the lowest tier bound
+            # (typically a negative drop: pruning improved val). Optionally
+            # treat as the least-sensitive → most-aggressive tier.
+            if fallback_last_tier:
+                ratios[rec["name"]] = min(1.0, max(0.0, tiers[-1][1] * scale))
     return ratios
+
+
+# Calibration scale for reallocation: the EXTREME ratios re-bucketed by
+# POST-training sensitivity under-shoot the target compression (easing the
+# FPN convs costs more than the proxy predicts, because they sit in the dense
+# part of the graph where pruning cascades downstream). A factor of 1.15
+# restores global param reduction to ~21.4% — matching the pre-train-keyed
+# EXTREME recipe — verified by a cascade-aware dry-run. See RUNS_PROVENANCE.md.
+REALLOC_SCALE = 1.15
+
+
+def load_reallocated_ratios(scale: float = 1.0) -> dict[str, float]:
+    """Per-layer ratios bucketed by POST-training impact instead of pre-training
+    sensitivity. Reads impact_analysis_train22.jsonl (produced by
+    analyze_pruning_impact.py) and buckets each layer's `post_train_pose_drop`
+    through the EXTREME tiers × REALLOC_SCALE. Net effect vs the pre-train recipe:
+    eases post-train-sensitive layers (FPN convs, SPPF.cv1, model.4.cv1 → 0) and
+    pushes empirically-free layers (model.8.cv0/cv2, box-head cv2.* branches)
+    harder, holding global compression constant. `scale` further tunes on top of
+    the baked-in calibration (default 1.0 → effective REALLOC_SCALE)."""
+    path = Path(__file__).resolve().parent / "impact_analysis_train22.jsonl"
+    return load_asymmetric_ratios(
+        jsonl_path=path,
+        scale=scale * REALLOC_SCALE,
+        tiers=SENSITIVITY_TIERS_EXTREME,
+        drop_field="post_train_pose_drop",
+        fallback_last_tier=True,  # negative-drop layers are the freest to prune
+    )
 
 
 # Criteria registry — must include any criterion exposed via --criterion.
@@ -272,6 +315,16 @@ def fine_tune(yolo: YOLO, **train_kwargs) -> nn.Module:
         # Setting it to 0 eliminates the spike entirely; one-epoch tests
         # showed no harm and the cumulative multi-step benefit is meaningful.
         "warmup_bias_lr": 0.0,
+        # Disable EarlyStopping. ultralytics' default patience (~100) tracks
+        # the global val-mAP peak across all epochs — but pruning produces
+        # spurious early peaks at LESS-pruned architectures (e.g. train35:
+        # ep17 hit 0.4936 at ~7% pruned, ep118 hit 0.4911 at the final 21.5%
+        # arch; patience counted from ep17 and stopped training at ep117,
+        # truncating the post-prune tail that was still climbing). Same root
+        # cause as best.pt: mAP-based control signals are unreliable across
+        # the architectural transition. patience=0 disables EarlyStop;
+        # override per-run if you really want it back.
+        "patience": 0,
     }
     # User kwargs take precedence over the safe defaults.
     overrides = {**yolo.overrides, **fine_tune_safe_defaults, **train_kwargs, "mode": "train"}
